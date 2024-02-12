@@ -2,70 +2,148 @@
 #include <M5Unified.h>
 #include "HX711.h"
 
+#define FLG_DEBUG_NOHX711 true
+
 #define SCALE 27.61f
 
 HX711 scale;
-int y = 0;
 uint8_t batteryLevel;
+unsigned long previousMillis = 0;
 
 void calibration();
+void measure();
+void updateBatteryLevel();
 
 void setup() {
   // init M5
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Power.begin();
-
-  M5.Display.setTextSize(1.25);
-  M5.Display.setCursor(0, y);
-  batteryLevel = M5.Power.getBatteryLevel();
-  M5.Display.printf("Battery: %3d%%", batteryLevel);
-  M5_LOGI("battery:%d", batteryLevel);
-  y += M5.Display.fontHeight();
+  M5.Display.startWrite(); 
+  M5.Display.setEpdMode(m5gfx::epd_fast);
+  M5.Display.fillScreen(TFT_WHITE);
 
   // setup scale
   uint8_t datPin = M5.getPin(m5::port_a_scl); // PIN1
   uint8_t clkPin = M5.getPin(m5::port_a_sda); // PIN2
+  #if FLG_DEBUG_NOHX711 == false
   scale.begin(datPin, clkPin);
-  // The scale value is the adc value corresponding to 1g
-  // scale.set_scale(27.61f);  // set scale
-  // scale.tare();             // auto set offset
-  calibration();
+  #endif
+
+  updateBatteryLevel();
+
+  esp_sleep_wakeup_cause_t wakeup_reason;
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch(wakeup_reason){
+    case ESP_SLEEP_WAKEUP_EXT0:
+    case ESP_SLEEP_WAKEUP_TIMER:
+      break;
+    default:
+      // calibrate scale when turn-on device manually
+      calibration();
+  }
+
+  measure(); // measure and display results
+
+  /// ピポッ
+  M5.Speaker.tone(2000, 100, 0, true);
+  M5.Speaker.tone(1000, 100, 0, false);
+
+  previousMillis = millis();
 }
 
 void loop() {
-  M5.delay(10);
+  M5.delay(100);
   M5.update();
-  batteryLevel = M5.Power.getBatteryLevel();
 
-  if (M5.BtnA.wasReleasedAfterHold()) { // 長押しでバッテリー残量
-    M5.Display.fillRect(0, 0, M5.Display.width(), M5.Display.fontHeight(), M5.Display.isEPD() ? TFT_WHITE : TFT_BLACK);
-    batteryLevel = M5.Power.getBatteryLevel();
-    M5.Display.setCursor(0, 0);
-    M5.Display.printf("Battery: %3d%%", batteryLevel);
-    M5_LOGI("battery:%d", batteryLevel);
-    M5.Display.setCursor(0, y);
-  } else if (M5.BtnA.wasSingleClicked()) {
-    // 計測する
-    float weight = scale.get_units(10) / 1000.0;
-    M5.Display.startWrite();
-    // M5.Display.fillScreen(M5.Display.isEPD() ? TFT_WHITE : TFT_BLACK);
-    M5.Display.setCursor(0, y);
-    if (weight >= 0) {
-      M5.Display.printf("%.2f", weight);
-    } else {
-      M5.Display.printf("0.00", weight);
-    }
-    Serial.printf("%.2f\n", weight);
-    M5_LOGI("weight:%.2f", weight);
-    y += M5.Display.fontHeight();
-    M5.Display.endWrite();
+  if (M5.BtnEXT.wasSingleClicked()) { // calibrate scale manually
+    calibration();
+  }
+
+  measure(); // measure and display results
+
+  // enter to deepsleep when after 5 seconds of bootup.
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis < 5000) {
+    // count down
+    unsigned long remainingSec = (currentMillis - previousMillis) / 1000;
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_BLACK);
+    M5.Display.fillRect(0, M5.Display.height() - M5.Display.fontHeight(), M5.Display.width(), M5.Display.fontHeight(), TFT_WHITE);
+    M5.Display.setCursor(0, M5.Display.height() - M5.Display.fontHeight());
+    M5.Display.printf("Sleep after: %d sec...", remainingSec);
+  } else {
+    // enter to deep sleep
+    // M5.Display.fillRect(0, M5.Display.height() - M5.Display.fontHeight(), M5.Display.width(), M5.Display.fontHeight(), TFT_WHITE);
+    // pinMode(GPIO_NUM_38, INPUT_PULLUP);
+    // esp_sleep_enable_ext0_wakeup(GPIO_NUM_38, LOW);
+    // esp_deep_sleep_start();
   }
 }
 
 // ------------------------------------------------------------------------------------------------
 
+void updateBatteryLevel() {
+  batteryLevel = M5.Power.getBatteryLevel();
+  M5_LOGI("battery:%d", batteryLevel);
+
+  M5.Display.setTextSize(1.5);
+  M5.Display.setTextColor(TFT_WHITE);
+  M5.Display.fillRect(0, 0, M5.Display.width(), M5.Display.fontHeight(), TFT_BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.printf("BAT: %3d%%", batteryLevel);
+}
+
+uint8_t chartWidth = 30;
+uint8_t maxLitter = 18.f;
+
+float prevValue = 0.f;
+
+void measure() {
+  #if FLG_DEBUG_NOHX711 == false
+  float weight = scale.get_units(10) / 1000.0;
+  #else
+  float weight = 20.f;
+  #endif
+  float litter = weight * 0.78;
+  if (maxLitter < litter) {
+    litter = maxLitter;
+  }
+  M5_LOGI("measure: weight=%.2f, value=%.2f", weight, litter);
+  if (prevValue == litter) {
+    return; // pass procedure when no change
+  }
+  prevValue = litter;
+  litter = 15.5f;
+  float percent = litter / (float)maxLitter;
+
+  uint8_t chartSize = M5.Display.height() - 30;
+  uint8_t y = (M5.Display.height() / 2);
+  uint8_t x = (M5.Display.width() / 2);
+  uint8_t r0 = (chartSize / 2);
+  float angle0 = ((float)(360.f * (1.f - percent)) - 90.f);
+  float angle1 = -90.f; // 0 point(270)
+
+  M5.Display.fillRect(0, (y - chartSize / 2), M5.Display.width(), chartSize, TFT_WHITE);
+  // pi chart
+  M5.Display.drawCircle(x, y, r0, TFT_BLACK);
+  M5.Display.drawCircle(x, y, (r0 - chartWidth), TFT_BLACK);
+  M5.Display.fillArc(x, y, r0, (r0 - chartWidth), angle0, angle1, TFT_BLACK);
+  // value labels
+  M5.Display.setTextColor(TFT_BLACK);
+  M5.Display.setTextSize(3);
+  y = y - M5.Display.fontHeight() / 2;
+  M5.Display.setCursor((x - (M5.Display.fontWidth() * 2.f)), y);
+  M5.Display.printf("%02.1f%%", percent);
+  y += M5.Display.fontHeight();
+  M5.Display.setTextSize(1.5);
+  M5.Display.setCursor((x - (M5.Display.fontWidth() * 2.5f)), y);
+  M5.Display.printf("%.2fL", litter);
+}
+
 void calibration() {
+  M5_LOGI("calibration");
+  #if FLG_DEBUG_NOHX711 == false
   Serial.println("Before setting up the scale:");
   Serial.printf("read: \t\t%.2f\n", scale.read()); // print a raw reading from the ADC
   Serial.printf("read average: \t\t%.2f\n", scale.read_average(20)); // print the average of 20 readings from the ADC
@@ -86,4 +164,5 @@ void calibration() {
   Serial.printf("get units: \t\t%.2f\n", scale.get_units(5));
   // print the average of 5 readings from the ADC minus tare weight, divided
   // by the SCALE parameter set with set_scale
+  #endif
 }
